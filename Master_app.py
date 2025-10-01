@@ -286,10 +286,13 @@ def seed_baseline_for_shop(shop: str) -> int:
               cursor
               node{
                 id
-                inventoryLevels(first:100){
+                inventoryLevels(first: 100){
                   nodes{
-                    location{ id }
-                    available
+                    location { id }
+                    quantities(names: ["available"]){
+                      name
+                      quantity
+                    }
                   }
                 }
               }
@@ -297,6 +300,7 @@ def seed_baseline_for_shop(shop: str) -> int:
             pageInfo{ hasNextPage endCursor }
           }
         }"""
+
         data = graphql(shop, q, {"cursor": cursor})
         items = ((data.get("inventoryItems") or {}).get("edges") or [])
         for e in items:
@@ -305,7 +309,12 @@ def seed_baseline_for_shop(shop: str) -> int:
             levels = ((node.get("inventoryLevels") or {}).get("nodes") or [])
             for lv in levels:
                 loc_id = gid_num((lv.get("location") or {}).get("id"))
-                available = int(lv.get("available") or 0)
+                qtys = (lv.get("quantities") or [])
+                available = 0
+                for qn in qtys:
+                    if (qn.get("name") or "").lower() == "available":
+                        available = int(qn.get("quantity") or 0)
+                        break
                 key = f"{shop}|{inv_item_id}:{loc_id}"
                 STATE["levels_by_loc"][key] = available
                 total += 1
@@ -388,6 +397,20 @@ def root_ok():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"ok": True}), 200
+@app.route("/track/product", methods=["POST", "OPTIONS"])
+def track_product():
+    if request.method == "OPTIONS":
+        return "", 200  # preflight OK
+    if request.args.get("key") != CONFIG["PIXEL_SHARED_SECRET"]:
+        abort(401)
+    ...
+@app.route("/track/atc", methods=["POST", "OPTIONS"])
+def track_atc():
+    if request.method == "OPTIONS":
+        return "", 200
+    if request.args.get("key") != CONFIG["PIXEL_SHARED_SECRET"]:
+        abort(401)
+    ...
 
 @app.route("/admin/init-baseline", methods=["GET"])
 def init_baseline_route():
