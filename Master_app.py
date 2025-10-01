@@ -286,7 +286,7 @@ def seed_baseline_for_shop(shop: str) -> int:
               cursor
               node{
                 id
-                inventoryLevels(first: 100){
+                inventoryLevels(first: 25){
                   nodes{
                     location { id }
                     quantities(names: ["available"]){
