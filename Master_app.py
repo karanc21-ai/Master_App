@@ -392,32 +392,71 @@ def init_baseline_route():
     count = seed_baseline_for_shop(shop)
     return jsonify({"ok": True, "shop": shop, "entries": count}), 200
 
+import os
+import json
+
 @app.route("/webhooks/shopify", methods=["POST"])
 def webhook_shopify():
     raw = request.get_data(cache=True)
     topic = request.headers.get("X-Shopify-Topic", "")
     shop_domain = (request.headers.get("X-Shopify-Shop-Domain") or "").lower().strip()
+    provided_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    trig_at = request.headers.get("X-Shopify-Triggered-At", "")
+    wh_id = request.headers.get("X-Shopify-Webhook-Id", "")
 
-    # Decide shop + secret
+    # Decide shop + secret (same as before)
     if CONFIG["COM_SHOP_DOMAIN"] and shop_domain.endswith(CONFIG["COM_SHOP_DOMAIN"].lower()):
         shop, secret = "com", CONFIG["COM_WEBHOOK_SECRET"]
     elif CONFIG["US_SHOP_DOMAIN"] and shop_domain.endswith(CONFIG["US_SHOP_DOMAIN"].lower()):
         shop, secret = "us", CONFIG["US_WEBHOOK_SECRET"]
     else:
-        # fallback guess
         shop = "com" if ".com" in shop_domain else "us"
         secret = CONFIG["COM_WEBHOOK_SECRET"] if shop == "com" else CONFIG["US_WEBHOOK_SECRET"]
 
-    if not verify_hmac(raw, request.headers.get("X-Shopify-Hmac-Sha256", ""), secret or ""):
+    # LOUD: incoming webhook line
+    log(f"WH IN topic={topic} shop={shop} shop_domain={shop_domain or '—'} "
+        f"hmac={'yes' if provided_hmac else 'no'} len={len(raw)} trig_at={trig_at or '—'} id={wh_id or '—'}")
+
+    # Optional: raw body (toggle with env)
+    if os.getenv("DEBUG_LOG_BODY", "0") == "1":
+        try:
+            sample = raw.decode("utf-8", "ignore")
+            if len(sample) > 2000:
+                sample = sample[:2000] + " …(truncated)…"
+            log(f"WH BODY: {sample}")
+        except Exception as e:
+            log(f"[WARN] Could not decode raw body: {e}")
+
+    # HMAC check
+    if not secret:
+        log("[ERR] No webhook secret configured for this shop; rejecting")
+        abort(401)
+    if not verify_hmac(raw, provided_hmac, secret):
+        log("[ERR] HMAC verification failed; rejecting")
         abort(401)
 
+    # Parse JSON (and log key fields)
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        log(f"[ERR] JSON parse failed: {e}")
+        abort(400, description="Invalid JSON payload")
+
+    inv_item_id = payload.get("inventory_item_id")
+    location_id = payload.get("location_id")
+    available   = payload.get("available")
+
+    log(f"WH OK topic={topic} inv_item_id={inv_item_id} location_id={location_id} available={available}")
+
+    # Only handle the topic we care about
     if topic != "inventory_levels/update":
-        log(f"WH ignored topic={topic}")
+        log(f"WH IGNORE topic={topic}")
         return "", 200
 
-    payload = request.get_json(force=True, silent=False) or {}
+    # Hand off to your existing handler
     handle_inventory_webhook(shop, payload)
     return "", 200
+
 
 # ---------------- Boot-time baseline (optional) ----------------
 
