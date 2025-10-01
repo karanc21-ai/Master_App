@@ -372,6 +372,14 @@ def handle_inventory_webhook(shop: str, payload: dict):
     save_state(STATE)
 
 # ---------------- Routes ----------------
+@app.route("/debug/ping", methods=["GET"])
+def debug_ping():
+    return jsonify({
+        "ok": True,
+        "time_utc": datetime.utcnow().isoformat() + "Z",
+        "expect_webhook": "/webhooks/shopify"
+    }), 200
+
 
 @app.route("/", methods=["GET", "HEAD"])
 def root_ok():
