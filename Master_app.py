@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
-import json
-import hmac
-import time
-import base64
-import sqlite3
-import hashlib
-import logging
+import os, sys, json, hmac, time, base64, sqlite3, hashlib, logging
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, request, abort, jsonify
-from datetime import datetime, timedelta
 
 # =========================
-# Config & app bootstrap
+# Config
 # =========================
 
 def env(name: str, default: str = "") -> str:
@@ -27,26 +19,26 @@ def env(name: str, default: str = "") -> str:
 
 CONFIG = {
     # Primary (.com)
-    "COM_SHOP_DOMAIN": env("COM_SHOP_DOMAIN"),            # e.g. rudradhan.myshopify.com
-    "COM_ADMIN_TOKEN": env("COM_ADMIN_TOKEN"),
+    "COM_SHOP_DOMAIN":    env("COM_SHOP_DOMAIN"),   # e.g. rudradhan.myshopify.com
+    "COM_ADMIN_TOKEN":    env("COM_ADMIN_TOKEN"),
     "COM_WEBHOOK_SECRET": env("COM_WEBHOOK_SECRET"),
 
     # Secondary (.us)
-    "US_SHOP_DOMAIN": env("US_SHOP_DOMAIN"),
-    "US_ADMIN_TOKEN": env("US_ADMIN_TOKEN"),
-    "US_WEBHOOK_SECRET": env("US_WEBHOOK_SECRET"),
+    "US_SHOP_DOMAIN":     env("US_SHOP_DOMAIN"),
+    "US_ADMIN_TOKEN":     env("US_ADMIN_TOKEN"),
+    "US_WEBHOOK_SECRET":  env("US_WEBHOOK_SECRET"),
 
     # Pixel shared secret (matches ?key=SECRET in your working pixel)
     "PIXEL_SHARED_SECRET": env("PIXEL_SHARED_SECRET"),
 
-    # Metafield strings & toggles
-    "BADGES_READY": env("BADGES_READY", "Ready To Ship"),
-    "DELIVERY_READY": env("DELIVERY_READY", "2-5 Days Across India"),
-    "DELIVERY_OOS": env("DELIVERY_OOS", "12-15 Days Across India"),
+    # Metafields & toggles
+    "BADGES_READY":     env("BADGES_READY", "Ready To Ship"),
+    "DELIVERY_READY":   env("DELIVERY_READY", "2-5 Days Across India"),
+    "DELIVERY_OOS":     env("DELIVERY_OOS", "12-15 Days Across India"),
     "WRITE_BADGES_COM": env("WRITE_BADGES_COM", "1"),
-    "WRITE_BADGES_US": env("WRITE_BADGES_US", "1"),
+    "WRITE_BADGES_US":  env("WRITE_BADGES_US", "1"),
 
-    # DB path (attach a Render disk at /data for persistence; will fallback to /tmp)
+    # DB path (attach a Render Disk at /data). Falls back to /tmp if not allowed.
     "DB_PATH": env("DB_PATH", "/data/app.db"),
 
     # Network timeouts
@@ -65,41 +57,37 @@ def ensure_db_path(p: str) -> str:
 CONFIG["DB_PATH"] = ensure_db_path(CONFIG["DB_PATH"])
 
 # =========================
-# Logger (unbuffered, friendly)
+# Logger (unbuffered)
 # =========================
 
-os.environ.setdefault("PYTHONUNBUFFERED", "1")  # ensure unbuffered stdout
-
-LOGGER_NAME = "rudradhan"
-logger = logging.getLogger(LOGGER_NAME)
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+logger = logging.getLogger("rudradhan")
 if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("[%(asctime)s IST] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(handler)
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("[%(asctime)s IST] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(h)
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-def log_line(msg: str) -> None:
-    logger.info(msg)
+def log_line(msg: str): logger.info(msg)
 
 # =========================
-# App + CORS
+# App + CORS + request trace
 # =========================
 
 app = Flask(__name__)
 
 @app.after_request
 def add_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
     resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Pixel-Token"
     return resp
 
-# Trace every incoming request so we can see path hits even before auth
 @app.before_request
-def _log_every_request():
-    origin = request.headers.get("Origin", "") or request.headers.get("Referer", "") or "-"
-    ua = request.headers.get("User-Agent", "")[:80]
+def _trace():
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or "-"
+    ua = (request.headers.get("User-Agent") or "")[:80]
     log_line(f"REQ {request.method} {request.path} origin={origin} ua={ua}")
 
 # =========================
@@ -113,8 +101,7 @@ def db() -> sqlite3.Connection:
 
 def init_db():
     with db() as conn:
-        conn.executescript(
-            """
+        conn.executescript("""
             PRAGMA journal_mode = WAL;
 
             CREATE TABLE IF NOT EXISTS webhook_seen (
@@ -135,7 +122,7 @@ def init_db():
               updated_at  INTEGER
             );
 
-            -- NEW: baseline keyed per shop + inventory_item_id + location_id
+            -- per-location baseline
             CREATE TABLE IF NOT EXISTS inv_baseline_new (
               shop TEXT NOT NULL,
               inventory_item_id INTEGER NOT NULL,
@@ -143,10 +130,8 @@ def init_db():
               last_available INTEGER,
               PRIMARY KEY (shop, inventory_item_id, location_id)
             );
-            """
-        )
-
-        # Migrate old inv_baseline (no location_id) if present
+        """)
+        # migrate old baseline (if any)
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "inv_baseline" in tables:
             conn.execute("""
@@ -156,21 +141,19 @@ def init_db():
             conn.execute("DROP TABLE inv_baseline")
         conn.execute("ALTER TABLE inv_baseline_new RENAME TO inv_baseline")
 
-        conn.executescript(
-            """
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS sku_map (
               shop TEXT NOT NULL,
               product_id INTEGER NOT NULL,
               sku TEXT NOT NULL,
               PRIMARY KEY (shop, product_id)
             );
-            """
-        )
+        """)
 
 init_db()
 
 # =========================
-# Shopify HTTP / GraphQL helpers
+# Shopify helpers
 # =========================
 
 def verify_shopify_hmac(raw: bytes, provided_b64: str, secret: str) -> bool:
@@ -193,10 +176,8 @@ def gid(kind: str, num_id: int) -> str:
     return f"gid://shopify/{kind}/{int(num_id)}"
 
 def gid_num(gid_str: Optional[str]) -> int:
-    try:
-        return int((gid_str or "").rsplit("/", 1)[-1])
-    except Exception:
-        return 0
+    try: return int((gid_str or "").rsplit("/", 1)[-1])
+    except: return 0
 
 def graphql(shop: str, query: str, variables: dict) -> dict:
     r = requests.post(
@@ -206,13 +187,13 @@ def graphql(shop: str, query: str, variables: dict) -> dict:
         timeout=CONFIG["HTTP_TIMEOUT"],
     )
     if r.status_code != 200:
-        raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
-    if "errors" in data and data["errors"]:
+    if data.get("errors"):
         raise RuntimeError(f"GraphQL errors: {data['errors']}")
     return data.get("data", {})
 
-# ---------- Title & SKU helpers ----------
+# --- lookups ---
 
 def get_product_title_by_product_id(shop: str, product_id: int) -> str:
     if not product_id:
@@ -378,13 +359,11 @@ def bump_primary_sales(sku: str, delta_sales: int):
     q = """
     query($id: ID!) {
       product(id:$id) {
-        title
         sales_total: metafield(namespace:"custom", key:"sales_total"){ value type }
         sales_dates: metafield(namespace:"custom", key:"sales_dates"){ value type }
       }
     }"""
-    cur_total = 0
-    cur_dates = []
+    cur_total, cur_dates = 0, []
     try:
         data = graphql("com", q, {"id": gid("Product", pid)})
         p = data.get("product") or {}
@@ -424,14 +403,13 @@ def bump_primary_views_or_atc_from_pixel(shop_host: str, product_id: int, kind: 
     3) Increment metafield on primary
     4) Log a friendly line with product title
     """
-    # Determine sending shop by host
     shop = "us" if ("rudradhan.us" in (shop_host or "")) else "com"
 
     sku = get_sku_from_product_id(shop, product_id)
     title_src = get_product_title_by_product_id(shop, product_id)
     show_shop = ".us" if shop == "us" else ".com"
 
-    # Fallback: if source is primary and no SKU, write directly on that product
+    # Primary fallback: if source is primary and no SKU, write directly on that product
     if shop == "com" and not sku and product_id:
         field_key = "views_total" if kind == "product" else "added_to_cart_total"
         q = f"""
@@ -522,7 +500,73 @@ def root_ok():
 def healthz():
     return jsonify({"ok": True}), 200
 
-# ----- Inventory webhook: .com -----
+# ----- Unified Inventory Webhook (the one that worked for you) -----
+
+@app.route("/webhooks/shopify", methods=["POST"])
+def webhook_shopify():
+    # Identify which shop sent the webhook by domain header
+    shop_domain_hdr = (request.headers.get("X-Shopify-Shop-Domain") or "").lower().strip()
+    topic = request.headers.get("X-Shopify-Topic", "")
+    if topic != "inventory_levels/update":
+        log_line(f"WH ignored topic={topic}")
+        return "", 200
+
+    # Choose secret by shop domain
+    if shop_domain_hdr.endswith((CONFIG["COM_SHOP_DOMAIN"] or "").lower()):
+        shop = "com"; secret = CONFIG["COM_WEBHOOK_SECRET"]
+    elif shop_domain_hdr.endswith((CONFIG["US_SHOP_DOMAIN"] or "").lower()):
+        shop = "us"; secret = CONFIG["US_WEBHOOK_SECRET"]
+    else:
+        # Fallback by guessing
+        shop = "com" if ".com" in shop_domain_hdr else "us"
+        secret = CONFIG["COM_WEBHOOK_SECRET"] if shop == "com" else CONFIG["US_WEBHOOK_SECRET"]
+
+    raw = request.get_data(cache=True)
+    if not verify_shopify_hmac(raw, request.headers.get("X-Shopify-Hmac-Sha256", ""), secret):
+        log_line(f"WH HMAC FAIL ({shop})")
+        abort(401)
+
+    webhook_id = request.headers.get("X-Shopify-Webhook-Id", "")
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM webhook_seen WHERE id=?", (webhook_id,)).fetchone():
+            return "", 200
+        conn.execute("INSERT OR IGNORE INTO webhook_seen(id, seen_at) VALUES (?,?)", (webhook_id, int(time.time())))
+
+    payload = request.get_json(force=True)
+    inv_id = int(payload.get("inventory_item_id"))
+    available = int(payload.get("available"))
+    loc_id = int(payload.get("location_id") or 0)
+    log_line(f"WH {'.com' if shop=='com' else '.us'} payload inv_item_id={inv_id} available={available} location_id={loc_id}")
+
+    sku, product_id, product_title = get_variant_product_info_from_inventory(shop, inv_id)
+    log_line(f"WH {'.com' if shop=='com' else '.us'} resolve sku={sku} product_id={product_id} title={product_title or '(unknown)'}")
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT last_available FROM inv_baseline WHERE shop=? AND inventory_item_id=? AND location_id=?",
+            (shop, inv_id, loc_id),
+        ).fetchone()
+        prev = int(row["last_available"]) if (row and row["last_available"] is not None) else None
+        conn.execute(
+            "INSERT OR REPLACE INTO inv_baseline(shop, inventory_item_id, location_id, last_available) VALUES (?,?,?,?)",
+            (shop, inv_id, loc_id, available),
+        )
+
+    log_line(f"WH {'.com' if shop=='com' else '.us'} baseline prev={prev} new={available} loc={loc_id}")
+    if prev is None or prev == available:
+        log_line(f"[{'.com' if shop=='com' else '.us'}] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id}, location_id={loc_id})")
+        adjust_badges_and_delivery(shop, product_id or 0, available)
+        return "", 200
+
+    delta = available - prev
+    if delta < 0 and sku:
+        bump_primary_sales(sku, -delta)
+
+    log_line(f"[{'.com' if shop=='com' else '.us'}] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev} → new: {available} (Δ={delta}, inv_item_id={inv_id}, location_id={loc_id})")
+    adjust_badges_and_delivery(shop, product_id or 0, available)
+    return "", 200
+
+# ----- Inventory webhook: .com (optional, still supported) -----
 
 @app.route("/webhooks/com/inventory", methods=["POST"])
 def com_inventory():
@@ -532,7 +576,6 @@ def com_inventory():
         log_line("WH HMAC FAIL (.com)")
         abort(401)
     topic = request.headers.get("X-Shopify-Topic", "")
-    log_line(f"WH .com topic={topic}")
     if topic != "inventory_levels/update":
         return "", 200
 
@@ -562,7 +605,6 @@ def com_inventory():
             ("com", inv_id, loc_id, available),
         )
 
-    log_line(f"WH .com baseline prev={prev} new={available} loc={loc_id}")
     if prev is None or prev == available:
         log_line(f"[.com] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id}, location_id={loc_id})")
         adjust_badges_and_delivery("com", product_id or 0, available)
@@ -576,7 +618,7 @@ def com_inventory():
     adjust_badges_and_delivery("com", product_id or 0, available)
     return "", 200
 
-# ----- Inventory webhook: .us -----
+# ----- Inventory webhook: .us (optional, still supported) -----
 
 @app.route("/webhooks/us/inventory", methods=["POST"])
 def us_inventory():
@@ -586,7 +628,6 @@ def us_inventory():
         log_line("WH HMAC FAIL (.us)")
         abort(401)
     topic = request.headers.get("X-Shopify-Topic", "")
-    log_line(f"WH .us topic={topic}")
     if topic != "inventory_levels/update":
         return "", 200
 
@@ -616,7 +657,6 @@ def us_inventory():
             ("us", inv_id, loc_id, available),
         )
 
-    log_line(f"WH .us baseline prev={prev} new={available} loc={loc_id}")
     if prev is None or prev == available:
         log_line(f"[.us] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id}, location_id={loc_id})")
         adjust_badges_and_delivery("us", product_id or 0, available)
@@ -630,7 +670,7 @@ def us_inventory():
     adjust_badges_and_delivery("us", product_id or 0, available)
     return "", 200
 
-# ----- Pixel endpoints (YOUR existing contract) -----
+# ----- Pixel endpoints (your proven contract) -----
 
 @app.route("/track/product", methods=["POST"])
 def track_product():
@@ -642,7 +682,6 @@ def track_product():
     if product_id <= 0 or not shop_host:
         return "", 200
 
-    # Dedup using coarse key if no event_id present
     ev_id = body.get("event_id") or f"{shop_host}:product:{product_id}:{int(body.get('ts') or 0)}"
     with db() as conn:
         if conn.execute("SELECT 1 FROM pixel_seen WHERE id=?", (ev_id,)).fetchone():
@@ -672,7 +711,7 @@ def track_atc():
     bump_primary_views_or_atc_from_pixel(shop_host, product_id, "atc", max(1, qty))
     return "", 200
 
-# ----- Alias endpoint: tolerant, always logs human lines -----
+# ----- Optional alias endpoint (tolerant). You can remove if noisy. -----
 
 @app.route("/events/pixel", methods=["POST", "OPTIONS"])
 def events_pixel():
@@ -681,7 +720,6 @@ def events_pixel():
 
     log_line("PIXEL hit")
 
-    # auth: header X-Pixel-Token or ?key=
     header_token = request.headers.get("X-Pixel-Token", "")
     qs_key = request.args.get("key", "")
     secret = CONFIG.get("PIXEL_SHARED_SECRET") or ""
@@ -695,7 +733,6 @@ def events_pixel():
     evt = (body.get("type") or "product_viewed").strip()
     qty = int(body.get("qty") or 1)
 
-    # shop host (from body or Origin)
     shop_host = (body.get("shop") or "").lower()
     if not shop_host:
         origin = (request.headers.get("Origin") or "").lower()
@@ -703,22 +740,18 @@ def events_pixel():
             shop_host = origin.split("://", 1)[1].split("/", 1)[0]
     tag = ".us" if "rudradhan.us" in (shop_host or "") else ".com"
 
-    # Accept productId or gid, else fallback to handle
     product_id = 0
     try:
         product_id = int(body.get("productId") or 0)
     except Exception:
         product_id = 0
-    gid = body.get("gid") or body.get("productGid") or ""
-    if not product_id and gid:
-        try:
-            product_id = int(str(gid).rsplit("/", 1)[-1])
-        except Exception:
-            product_id = 0
+    gid_val = body.get("gid") or body.get("productGid") or ""
+    if not product_id and gid_val:
+        try: product_id = int(str(gid_val).rsplit("/", 1)[-1])
+        except Exception: product_id = 0
 
     handle = (body.get("handle") or "").strip()
 
-    # If we have none of productId/gid/handle → ignore (no noise)
     if product_id <= 0 and not handle:
         ts_int = int(body.get("ts") or 0)
         event_id = body.get("event_id") or f"{shop_host}:{evt}:ignored:{ts_int}"
@@ -729,7 +762,6 @@ def events_pixel():
         log_line(f"PIXEL IGNORED: missing productId/gid/handle (shop={shop_host or '—'}, evt={evt})")
         return "", 204
 
-    # dedupe id
     ts_int = int(body.get("ts") or 0)
     event_id = body.get("event_id") or f"{shop_host}:{evt}:{product_id or handle}:{ts_int}"
     with db() as conn:
@@ -737,7 +769,6 @@ def events_pixel():
             return "", 200
         conn.execute("INSERT OR IGNORE INTO pixel_seen(id, seen_at) VALUES (?,?)", (event_id, int(time.time())))
 
-    # resolve title for log
     title = ""
     if product_id > 0:
         shop = "us" if "rudradhan.us" in (shop_host or "") else "com"
@@ -752,7 +783,6 @@ def events_pixel():
         log_line(f"PIXEL resolved: tag={tag} kind={'atc' if kind=='atc' else 'view'} product_id={product_id}")
         bump_primary_views_or_atc_from_pixel(shop_host, product_id, kind, max(1, qty))
 
-    # Always emit a human line
     if kind == "product":
         log_line(f"[{tag}] VIEWED: {title}")
     else:
@@ -765,5 +795,4 @@ def events_pixel():
 # =========================
 
 if __name__ == "__main__":
-    # For local dev: python app.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
