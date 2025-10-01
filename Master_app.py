@@ -68,7 +68,7 @@ CONFIG["DB_PATH"] = ensure_db_path(CONFIG["DB_PATH"])
 # Logger (unbuffered, friendly)
 # =========================
 
-os.environ.setdefault("PYTHONUNBUFFERED", "1")  # ensure unbuffered stdout on some platforms
+os.environ.setdefault("PYTHONUNBUFFERED", "1")  # ensure unbuffered stdout
 
 LOGGER_NAME = "rudradhan"
 logger = logging.getLogger(LOGGER_NAME)
@@ -116,14 +116,17 @@ def init_db():
         conn.executescript(
             """
             PRAGMA journal_mode = WAL;
+
             CREATE TABLE IF NOT EXISTS webhook_seen (
               id TEXT PRIMARY KEY,
               seen_at INTEGER
             );
+
             CREATE TABLE IF NOT EXISTS pixel_seen (
               id TEXT PRIMARY KEY,
               seen_at INTEGER
             );
+
             CREATE TABLE IF NOT EXISTS sku_totals (
               sku TEXT PRIMARY KEY,
               views_total INTEGER NOT NULL DEFAULT 0,
@@ -131,12 +134,30 @@ def init_db():
               sales_total INTEGER NOT NULL DEFAULT 0,
               updated_at  INTEGER
             );
-            CREATE TABLE IF NOT EXISTS inv_baseline (
+
+            -- NEW: baseline keyed per shop + inventory_item_id + location_id
+            CREATE TABLE IF NOT EXISTS inv_baseline_new (
               shop TEXT NOT NULL,
               inventory_item_id INTEGER NOT NULL,
+              location_id INTEGER NOT NULL,
               last_available INTEGER,
-              PRIMARY KEY (shop, inventory_item_id)
+              PRIMARY KEY (shop, inventory_item_id, location_id)
             );
+            """
+        )
+
+        # Migrate old inv_baseline (no location_id) if present
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "inv_baseline" in tables:
+            conn.execute("""
+                INSERT OR IGNORE INTO inv_baseline_new (shop, inventory_item_id, location_id, last_available)
+                SELECT shop, inventory_item_id, 0 AS location_id, last_available FROM inv_baseline
+            """)
+            conn.execute("DROP TABLE inv_baseline")
+        conn.execute("ALTER TABLE inv_baseline_new RENAME TO inv_baseline")
+
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS sku_map (
               shop TEXT NOT NULL,
               product_id INTEGER NOT NULL,
@@ -410,6 +431,34 @@ def bump_primary_views_or_atc_from_pixel(shop_host: str, product_id: int, kind: 
     title_src = get_product_title_by_product_id(shop, product_id)
     show_shop = ".us" if shop == "us" else ".com"
 
+    # Fallback: if source is primary and no SKU, write directly on that product
+    if shop == "com" and not sku and product_id:
+        field_key = "views_total" if kind == "product" else "added_to_cart_total"
+        q = f"""
+        query($id: ID!) {{
+          product(id:$id) {{
+            title
+            mf: metafield(namespace:"custom", key:"{field_key}") {{ value type }}
+          }}
+        }}"""
+        try:
+            data = graphql("com", q, {"id": gid("Product", product_id)})
+            p = data.get("product") or {}
+            mf = p.get("mf")
+            cur = 0
+            if mf and mf.get("type") == "number_integer" and mf.get("value"):
+                cur = int(mf["value"])
+            new_val = cur + int(max(1, qty))
+            set_product_metafields_primary(product_id, {("custom", field_key, "number_integer"): str(new_val)})
+            pretty_title = (p.get("title") or title_src or "(unknown title)").strip()
+            if kind == "product":
+                log_line(f"[.com] VIEWED: {pretty_title} (no SKU fallback) → views_total={new_val}")
+            else:
+                log_line(f"[.com] ADDED TO CART ×{max(1, qty)}: {pretty_title} (no SKU fallback) → added_to_cart_total={new_val}")
+            return
+        except Exception as e:
+            print(f"[WARN] primary no-SKU fallback failed: {e}")
+
     pid_primary, _ = get_primary_product_by_sku(sku) if sku else (None, None)
     if not pid_primary:
         action = "VIEWED" if kind == "product" else f"ADDED TO CART ×{max(1, qty)}"
@@ -496,25 +545,26 @@ def com_inventory():
     payload = request.get_json(force=True)
     inv_id = int(payload.get("inventory_item_id"))
     available = int(payload.get("available"))
-    log_line(f"WH .com payload inv_item_id={inv_id} available={available}")
+    loc_id = int(payload.get("location_id") or 0)
+    log_line(f"WH .com payload inv_item_id={inv_id} available={available} location_id={loc_id}")
 
     sku, product_id, product_title = get_variant_product_info_from_inventory("com", inv_id)
     log_line(f"WH .com resolve sku={sku} product_id={product_id} title={product_title or '(unknown)'}")
 
     with db() as conn:
         row = conn.execute(
-            "SELECT last_available FROM inv_baseline WHERE shop=? AND inventory_item_id=?",
-            ("com", inv_id),
+            "SELECT last_available FROM inv_baseline WHERE shop=? AND inventory_item_id=? AND location_id=?",
+            ("com", inv_id, loc_id),
         ).fetchone()
         prev = int(row["last_available"]) if (row and row["last_available"] is not None) else None
         conn.execute(
-            "INSERT OR REPLACE INTO inv_baseline(shop, inventory_item_id, last_available) VALUES (?,?,?)",
-            ("com", inv_id, available),
+            "INSERT OR REPLACE INTO inv_baseline(shop, inventory_item_id, location_id, last_available) VALUES (?,?,?,?)",
+            ("com", inv_id, loc_id, available),
         )
 
-    log_line(f"WH .com baseline prev={prev} new={available}")
+    log_line(f"WH .com baseline prev={prev} new={available} loc={loc_id}")
     if prev is None or prev == available:
-        log_line(f"[.com] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id})")
+        log_line(f"[.com] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id}, location_id={loc_id})")
         adjust_badges_and_delivery("com", product_id or 0, available)
         return "", 200
 
@@ -522,7 +572,7 @@ def com_inventory():
     if delta < 0 and sku:
         bump_primary_sales(sku, -delta)
 
-    log_line(f"[.com] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev} → new: {available} (Δ={delta}, inv_item_id={inv_id})")
+    log_line(f"[.com] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev} → new: {available} (Δ={delta}, inv_item_id={inv_id}, location_id={loc_id})")
     adjust_badges_and_delivery("com", product_id or 0, available)
     return "", 200
 
@@ -549,25 +599,26 @@ def us_inventory():
     payload = request.get_json(force=True)
     inv_id = int(payload.get("inventory_item_id"))
     available = int(payload.get("available"))
-    log_line(f"WH .us payload inv_item_id={inv_id} available={available}")
+    loc_id = int(payload.get("location_id") or 0)
+    log_line(f"WH .us payload inv_item_id={inv_id} available={available} location_id={loc_id}")
 
     sku, product_id, product_title = get_variant_product_info_from_inventory("us", inv_id)
     log_line(f"WH .us resolve sku={sku} product_id={product_id} title={product_title or '(unknown)'}")
 
     with db() as conn:
         row = conn.execute(
-            "SELECT last_available FROM inv_baseline WHERE shop=? AND inventory_item_id=?",
-            ("us", inv_id),
+            "SELECT last_available FROM inv_baseline WHERE shop=? AND inventory_item_id=? AND location_id=?",
+            ("us", inv_id, loc_id),
         ).fetchone()
         prev = int(row["last_available"]) if (row and row["last_available"] is not None) else None
         conn.execute(
-            "INSERT OR REPLACE INTO inv_baseline(shop, inventory_item_id, last_available) VALUES (?,?,?)",
-            ("us", inv_id, available),
+            "INSERT OR REPLACE INTO inv_baseline(shop, inventory_item_id, location_id, last_available) VALUES (?,?,?,?)",
+            ("us", inv_id, loc_id, available),
         )
 
-    log_line(f"WH .us baseline prev={prev} new={available}")
+    log_line(f"WH .us baseline prev={prev} new={available} loc={loc_id}")
     if prev is None or prev == available:
-        log_line(f"[.us] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id})")
+        log_line(f"[.us] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev if prev is not None else '—'} → new: {available} (inv_item_id={inv_id}, location_id={loc_id})")
         adjust_badges_and_delivery("us", product_id or 0, available)
         return "", 200
 
@@ -575,7 +626,7 @@ def us_inventory():
     if delta < 0 and sku:
         bump_primary_sales(sku, -delta)
 
-    log_line(f"[.us] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev} → new: {available} (Δ={delta}, inv_item_id={inv_id})")
+    log_line(f"[.us] AVAILABILITY: {product_title or '(unknown title)'} (SKU: {sku or '—'}) prev: {prev} → new: {available} (Δ={delta}, inv_item_id={inv_id}, location_id={loc_id})")
     adjust_badges_and_delivery("us", product_id or 0, available)
     return "", 200
 
@@ -640,10 +691,11 @@ def events_pixel():
     log_line("PIXEL auth OK")
 
     body = request.get_json(force=True, silent=True) or {}
+    log_line(f"PIXEL keys={sorted(list(body.keys()))}")
     evt = (body.get("type") or "product_viewed").strip()
     qty = int(body.get("qty") or 1)
 
-    # shop host
+    # shop host (from body or Origin)
     shop_host = (body.get("shop") or "").lower()
     if not shop_host:
         origin = (request.headers.get("Origin") or "").lower()
@@ -651,7 +703,7 @@ def events_pixel():
             shop_host = origin.split("://", 1)[1].split("/", 1)[0]
     tag = ".us" if "rudradhan.us" in (shop_host or "") else ".com"
 
-    # product id (accept productId or gid/productGid)
+    # Accept productId or gid, else fallback to handle
     product_id = 0
     try:
         product_id = int(body.get("productId") or 0)
@@ -666,7 +718,16 @@ def events_pixel():
 
     handle = (body.get("handle") or "").strip()
 
-    log_line(f"PIXEL evt={evt} qty={qty} shop={shop_host or '(derived)'} productId={product_id} handle={handle}")
+    # If we have none of productId/gid/handle → ignore (no noise)
+    if product_id <= 0 and not handle:
+        ts_int = int(body.get("ts") or 0)
+        event_id = body.get("event_id") or f"{shop_host}:{evt}:ignored:{ts_int}"
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM pixel_seen WHERE id=?", (event_id,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO pixel_seen(id, seen_at) VALUES (?,?)",
+                             (event_id, int(time.time())))
+        log_line(f"PIXEL IGNORED: missing productId/gid/handle (shop={shop_host or '—'}, evt={evt})")
+        return "", 204
 
     # dedupe id
     ts_int = int(body.get("ts") or 0)
@@ -678,7 +739,7 @@ def events_pixel():
 
     # resolve title for log
     title = ""
-    if product_id:
+    if product_id > 0:
         shop = "us" if "rudradhan.us" in (shop_host or "") else "com"
         title = get_product_title_by_product_id(shop, product_id)
     if not title and handle:
@@ -686,13 +747,12 @@ def events_pixel():
     if not title:
         title = "(unknown title)"
 
-    # do the counters (also logs inside) when possible
     kind = "atc" if evt == "product_added_to_cart" else "product"
-    if product_id and shop_host:
+    if product_id > 0 and shop_host:
         log_line(f"PIXEL resolved: tag={tag} kind={'atc' if kind=='atc' else 'view'} product_id={product_id}")
         bump_primary_views_or_atc_from_pixel(shop_host, product_id, kind, max(1, qty))
 
-    # human-friendly line (always)
+    # Always emit a human line
     if kind == "product":
         log_line(f"[{tag}] VIEWED: {title}")
     else:
